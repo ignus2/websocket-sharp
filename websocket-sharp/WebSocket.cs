@@ -117,6 +117,8 @@ namespace WebSocketSharp
     private Stream                         _stream;
     private TcpClient                      _tcpClient;
     private Uri                            _uri;
+    private System.Net.IPEndPoint          _localEndPoint;
+    private int                            _connectTimeout = -1;
     private const string                   _version = "13";
     private TimeSpan                       _waitTime;
 
@@ -279,6 +281,11 @@ namespace WebSocketSharp
       _waitTime = TimeSpan.FromSeconds (5);
 
       init ();
+    }
+
+    public WebSocket(System.Net.IPEndPoint localEndPoint, string url, params string[] protocols) : this(url, protocols)
+    {
+      _localEndPoint = localEndPoint;
     }
 
     #endregion
@@ -2092,7 +2099,7 @@ namespace WebSocketSharp
         if (_proxyCredentials != null) {
           if (res.HasConnectionClose) {
             releaseClientResources ();
-            _tcpClient = new TcpClient (_proxyUri.DnsSafeHost, _proxyUri.Port);
+            _tcpClient = createTcpClient (_proxyUri.DnsSafeHost, _proxyUri.Port);
             _stream = _tcpClient.GetStream ();
           }
 
@@ -2110,16 +2117,33 @@ namespace WebSocketSharp
           "The proxy has failed a connection to the requested host and port.");
     }
 
+    private TcpClient createTcpClient (string hostname, int port)
+    {
+      TcpClient cl = _localEndPoint != null ? new TcpClient (_localEndPoint) : new TcpClient ();
+      if (_connectTimeout < 0) {
+        cl.Connect (hostname, port);
+      }
+      else {
+        IAsyncResult ar = cl.BeginConnect (hostname, port, null, null);
+        if (!ar.AsyncWaitHandle.WaitOne (_connectTimeout)) {
+          cl.Close ();
+          throw new TimeoutException ("TCP connect timed out");
+        }
+        cl.EndConnect (ar);
+      }
+      return cl;
+    }
+
     // As client
     private void setClientStream ()
     {
       if (_proxyUri != null) {
-        _tcpClient = new TcpClient (_proxyUri.DnsSafeHost, _proxyUri.Port);
+        _tcpClient = createTcpClient (_proxyUri.DnsSafeHost, _proxyUri.Port);
         _stream = _tcpClient.GetStream ();
         sendProxyConnectRequest ();
       }
       else {
-        _tcpClient = new TcpClient (_uri.DnsSafeHost, _uri.Port);
+        _tcpClient = createTcpClient (_uri.DnsSafeHost, _uri.Port);
         _stream = _tcpClient.GetStream ();
       }
 
@@ -3264,7 +3288,7 @@ namespace WebSocketSharp
     ///   A series of reconnecting has failed.
     ///   </para>
     /// </exception>
-    public void ConnectAsync ()
+    public void ConnectAsync (int timeout)
     {
       if (!_client) {
         var msg = "This instance is not a client.";
@@ -3281,6 +3305,8 @@ namespace WebSocketSharp
         throw new InvalidOperationException (msg);
       }
 
+      _connectTimeout = timeout;
+
       Func<bool> connector = connect;
       connector.BeginInvoke (
         ar => {
@@ -3289,6 +3315,11 @@ namespace WebSocketSharp
         },
         null
       );
+    }
+
+    public void ConnectAsync ()
+    {
+      ConnectAsync(-1);
     }
 
     /// <summary>
