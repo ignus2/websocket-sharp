@@ -55,6 +55,56 @@ using WebSocketSharp.Net.WebSockets;
 
 namespace WebSocketSharp
 {
+  internal class BackgroundTaskQueue
+  {
+    volatile bool exit = false;
+    readonly Queue<Action> q = new Queue<Action>();
+    readonly Thread thread;
+
+    public BackgroundTaskQueue()
+    {
+      thread = new Thread(RunLoop);
+      thread.Start();
+    }
+
+    public void Enqueue(Action action)
+    {
+      lock (q)
+      {
+        q.Enqueue(action);
+        Monitor.Pulse(q);
+      }
+    }
+
+    public void Exit()
+    {
+      lock (q)
+      {
+        exit = true;
+        Monitor.Pulse(q);
+      }
+    }
+
+    private void RunLoop()
+    {
+      while (true)
+      {
+        Action action = null;
+        lock (q)
+        {
+          if (exit) break;
+          if (q.Count > 0) action = q.Dequeue();
+          else Monitor.Wait(q);
+        }
+        try
+        {
+          action?.Invoke();
+        }
+        catch (Exception) { }
+      }
+    }
+  }
+
   /// <summary>
   /// Implements the WebSocket interface.
   /// </summary>
@@ -119,6 +169,7 @@ namespace WebSocketSharp
     private Uri                            _uri;
     private System.Net.IPEndPoint          _localEndPoint;
     private int                            _connectTimeout = -1;
+    BackgroundTaskQueue                    _backgroundSender;
     private const string                   _version = "13";
     private TimeSpan                       _waitTime;
 
@@ -1892,6 +1943,9 @@ namespace WebSocketSharp
     // As client
     private void releaseClientResources ()
     {
+      _backgroundSender?.Exit();
+      _backgroundSender = null;
+
       if (_stream != null) {
         _stream.Dispose ();
         _stream = null;
@@ -1935,6 +1989,9 @@ namespace WebSocketSharp
     // As server
     private void releaseServerResources ()
     {
+      _backgroundSender?.Exit();
+      _backgroundSender = null;
+
       if (_closeContext == null)
         return;
 
@@ -2041,26 +2098,48 @@ namespace WebSocketSharp
 
     private void sendAsync (Opcode opcode, Stream stream, Action<bool> completed)
     {
-      Func<Opcode, Stream, bool> sender = send;
-      sender.BeginInvoke (
-        opcode,
-        stream,
-        ar => {
-          try {
-            var sent = sender.EndInvoke (ar);
-            if (completed != null)
-              completed (sent);
-          }
-          catch (Exception ex) {
-            _logger.Error (ex.ToString ());
-            error (
-              "An error has occurred during the callback for an async send.",
-              ex
-            );
-          }
-        },
-        null
-      );
+      if (_backgroundSender == null)
+      {
+        _backgroundSender = new BackgroundTaskQueue();
+      }
+
+      _backgroundSender.Enqueue(() =>
+      {
+        try
+        {
+          bool sent = send(opcode, stream);
+          completed?.Invoke(sent);
+        }
+        catch (Exception ex)
+        {
+          _logger.Error(ex.ToString());
+          error(
+            "An error has occurred during the callback for an async send.",
+            ex
+          );
+        }
+      });
+
+      //Func<Opcode, Stream, bool> sender = send;
+      //sender.BeginInvoke (
+      //  opcode,
+      //  stream,
+      //  ar => {
+      //    try {
+      //      var sent = sender.EndInvoke (ar);
+      //      if (completed != null)
+      //        completed (sent);
+      //    }
+      //    catch (Exception ex) {
+      //      _logger.Error (ex.ToString ());
+      //      error (
+      //        "An error has occurred during the callback for an async send.",
+      //        ex
+      //      );
+      //    }
+      //  },
+      //  null
+      //);
     }
 
     private bool sendBytes (byte[] bytes)
