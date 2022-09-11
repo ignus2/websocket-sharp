@@ -8,7 +8,7 @@
  * The MIT License
  *
  * Copyright (c) 2005 Novell, Inc. (http://www.novell.com)
- * Copyright (c) 2012-2021 sta.blockhead
+ * Copyright (c) 2012-2022 sta.blockhead
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -57,6 +57,17 @@ namespace WebSocketSharp.Net
   /// <summary>
   /// Provides a simple, programmatically controlled HTTP listener.
   /// </summary>
+  /// <remarks>
+  ///   <para>
+  ///   The listener supports HTTP/1.1 version request and response.
+  ///   </para>
+  ///   <para>
+  ///   And the listener allows to accept WebSocket handshake requests.
+  ///   </para>
+  ///   <para>
+  ///   This class cannot be inherited.
+  ///   </para>
+  /// </remarks>
   public sealed class HttpListener : IDisposable
   {
     #region Private Fields
@@ -77,6 +88,7 @@ namespace WebSocketSharp.Net
     private string                                           _realm;
     private bool                                             _reuseAddress;
     private ServerSslConfiguration                           _sslConfig;
+    private object                                           _sync;
     private Func<IIdentity, NetworkCredential>               _userCredFinder;
     private Queue<HttpListenerAsyncResult>                   _waitQueue;
 
@@ -107,6 +119,7 @@ namespace WebSocketSharp.Net
       _log = new Logger ();
       _objectName = GetType ().ToString ();
       _prefixes = new HttpListenerPrefixCollection (this);
+      _sync = new object ();
       _waitQueue = new Queue<HttpListenerAsyncResult> ();
     }
 
@@ -480,15 +493,38 @@ namespace WebSocketSharp.Net
 
     #region Private Methods
 
+    private bool authenticateClient (HttpListenerContext context)
+    {
+      var schm = selectAuthenticationScheme (context.Request);
+
+      if (schm == AuthenticationSchemes.Anonymous)
+        return true;
+
+      if (schm == AuthenticationSchemes.None) {
+        var msg = "Authentication not allowed";
+        context.SendError (403, msg);
+
+        return false;
+      }
+
+      var realm = getRealm ();
+
+      if (!context.SetUser (schm, realm, _userCredFinder)) {
+        context.SendAuthenticationChallenge (schm, realm);
+
+        return false;
+      }
+
+      return true;
+    }
+
     private HttpListenerAsyncResult beginGetContext (
       AsyncCallback callback, object state
     )
     {
       lock (_contextRegistrySync) {
         if (!_listening) {
-          var msg = _disposed
-                    ? "The listener is closed."
-                    : "The listener is stopped.";
+          var msg = "The method is canceled.";
 
           throw new HttpListenerException (995, msg);
         }
@@ -497,11 +533,12 @@ namespace WebSocketSharp.Net
 
         if (_contextQueue.Count == 0) {
           _waitQueue.Enqueue (ares);
+
+          return ares;
         }
-        else {
-          var ctx = _contextQueue.Dequeue ();
-          ares.Complete (ctx, true);
-        }
+
+        var ctx = _contextQueue.Dequeue ();
+        ares.Complete (ctx, true);
 
         return ares;
       }
@@ -522,10 +559,8 @@ namespace WebSocketSharp.Net
 
       _contextQueue.Clear ();
 
-      foreach (var ctx in ctxs) {
-        ctx.ErrorStatusCode = 503;
-        ctx.SendError ();
-      }
+      foreach (var ctx in ctxs)
+        ctx.SendError (503);
     }
 
     private void cleanupContextRegistry ()
@@ -536,9 +571,11 @@ namespace WebSocketSharp.Net
         return;
 
       var ctxs = new HttpListenerContext[cnt];
-      _contextRegistry.CopyTo (ctxs, 0);
 
-      _contextRegistry.Clear ();
+      lock (_contextRegistrySync) {
+        _contextRegistry.CopyTo (ctxs, 0);
+        _contextRegistry.Clear ();
+      }
 
       foreach (var ctx in ctxs)
         ctx.Connection.Close (true);
@@ -561,23 +598,30 @@ namespace WebSocketSharp.Net
 
     private void close (bool force)
     {
-      if (!_listening) {
+      lock (_sync) {
+        if (_disposed)
+          return;
+
+        lock (_contextRegistrySync) {
+          if (!_listening) {
+            _disposed = true;
+
+            return;
+          }
+
+          _listening = false;
+        }
+
+        cleanupContextQueue (force);
+        cleanupContextRegistry ();
+
+        var msg = "The listener is closed.";
+        cleanupWaitQueue (msg);
+
+        EndPointManager.RemoveListener (this);
+
         _disposed = true;
-
-        return;
       }
-
-      _listening = false;
-
-      cleanupContextQueue (force);
-      cleanupContextRegistry ();
-
-      var msg = "The listener is closed.";
-      cleanupWaitQueue (msg);
-
-      EndPointManager.RemoveListener (this);
-
-      _disposed = true;
     }
 
     private string getRealm ()
@@ -585,6 +629,32 @@ namespace WebSocketSharp.Net
       var realm = _realm;
 
       return realm != null && realm.Length > 0 ? realm : _defaultRealm;
+    }
+
+    private bool registerContext (HttpListenerContext context)
+    {
+      if (!_listening)
+        return false;
+
+      lock (_contextRegistrySync) {
+        if (!_listening)
+          return false;
+
+        context.Listener = this;
+
+        _contextRegistry.AddLast (context);
+
+        if (_waitQueue.Count == 0) {
+          _contextQueue.Enqueue (context);
+
+          return true;
+        }
+
+        var ares = _waitQueue.Dequeue ();
+        ares.Complete (context, false);
+
+        return true;
+      }
     }
 
     private AuthenticationSchemes selectAuthenticationScheme (
@@ -608,45 +678,6 @@ namespace WebSocketSharp.Net
 
     #region Internal Methods
 
-    internal bool AuthenticateContext (HttpListenerContext context)
-    {
-      var req = context.Request;
-      var schm = selectAuthenticationScheme (req);
-
-      if (schm == AuthenticationSchemes.Anonymous)
-        return true;
-
-      if (schm == AuthenticationSchemes.None) {
-        context.ErrorStatusCode = 403;
-        context.ErrorMessage = "Authentication not allowed";
-
-        context.SendError ();
-
-        return false;
-      }
-
-      var realm = getRealm ();
-      var user = HttpUtility.CreateUser (
-                   req.Headers["Authorization"],
-                   schm,
-                   realm,
-                   req.HttpMethod,
-                   _userCredFinder
-                 );
-
-      var authenticated = user != null && user.Identity.IsAuthenticated;
-
-      if (!authenticated) {
-        context.SendAuthenticationChallenge (schm, realm);
-
-        return false;
-      }
-
-      context.User = user;
-
-      return true;
-    }
-
     internal void CheckDisposed ()
     {
       if (_disposed)
@@ -655,27 +686,16 @@ namespace WebSocketSharp.Net
 
     internal bool RegisterContext (HttpListenerContext context)
     {
-      if (!_listening)
+      if (!authenticateClient (context))
         return false;
 
-      lock (_contextRegistrySync) {
-        if (!_listening)
-          return false;
+      if (!registerContext (context)) {
+        context.SendError (503);
 
-        context.Listener = this;
-
-        _contextRegistry.AddLast (context);
-
-        if (_waitQueue.Count == 0) {
-          _contextQueue.Enqueue (context);
-        }
-        else {
-          var ares = _waitQueue.Dequeue ();
-          ares.Complete (context, false);
-        }
-
-        return true;
+        return false;
       }
+
+      return true;
     }
 
     internal void UnregisterContext (HttpListenerContext context)
@@ -696,12 +716,7 @@ namespace WebSocketSharp.Net
       if (_disposed)
         return;
 
-      lock (_contextRegistrySync) {
-        if (_disposed)
-          return;
-
-        close (true);
-      }
+      close (true);
     }
 
     /// <summary>
@@ -722,22 +737,22 @@ namespace WebSocketSharp.Net
     /// the asynchronous operation.
     /// </returns>
     /// <param name="callback">
-    /// An <see cref="AsyncCallback"/> delegate that references the method to
-    /// invoke when the asynchronous operation completes.
+    /// An <see cref="AsyncCallback"/> delegate that references the method
+    /// to invoke when the asynchronous operation completes.
     /// </param>
     /// <param name="state">
-    /// An <see cref="object"/> that represents a user defined object to
+    /// An <see cref="object"/> that specifies a user defined object to
     /// pass to <paramref name="callback"/>.
     /// </param>
     /// <exception cref="InvalidOperationException">
     ///   <para>
-    ///   This listener has no URI prefix on which listens.
+    ///   This listener has not been started or is currently stopped.
     ///   </para>
     ///   <para>
     ///   -or-
     ///   </para>
     ///   <para>
-    ///   This listener has not been started or is currently stopped.
+    ///   This listener has no URI prefix on which listens.
     ///   </para>
     /// </exception>
     /// <exception cref="HttpListenerException">
@@ -751,14 +766,14 @@ namespace WebSocketSharp.Net
       if (_disposed)
         throw new ObjectDisposedException (_objectName);
 
-      if (_prefixes.Count == 0) {
-        var msg = "The listener has no URI prefix on which listens.";
+      if (!_listening) {
+        var msg = "The listener has not been started.";
 
         throw new InvalidOperationException (msg);
       }
 
-      if (!_listening) {
-        var msg = "The listener has not been started.";
+      if (_prefixes.Count == 0) {
+        var msg = "The listener has no URI prefix on which listens.";
 
         throw new InvalidOperationException (msg);
       }
@@ -774,20 +789,15 @@ namespace WebSocketSharp.Net
       if (_disposed)
         return;
 
-      lock (_contextRegistrySync) {
-        if (_disposed)
-          return;
-
-        close (false);
-      }
+      close (false);
     }
 
     /// <summary>
     /// Ends an asynchronous operation to get an incoming request.
     /// </summary>
     /// <remarks>
-    /// This method completes an asynchronous operation started by calling
-    /// the BeginGetContext method.
+    /// This method completes an asynchronous operation started by
+    /// calling the BeginGetContext method.
     /// </remarks>
     /// <returns>
     /// A <see cref="HttpListenerContext"/> that represents a request.
@@ -804,7 +814,15 @@ namespace WebSocketSharp.Net
     /// the BeginGetContext method.
     /// </exception>
     /// <exception cref="InvalidOperationException">
-    /// This method was already called for <paramref name="asyncResult"/>.
+    ///   <para>
+    ///   This listener has not been started or is currently stopped.
+    ///   </para>
+    ///   <para>
+    ///   -or-
+    ///   </para>
+    ///   <para>
+    ///   This method was already called for <paramref name="asyncResult"/>.
+    ///   </para>
     /// </exception>
     /// <exception cref="HttpListenerException">
     /// This method is canceled.
@@ -816,6 +834,12 @@ namespace WebSocketSharp.Net
     {
       if (_disposed)
         throw new ObjectDisposedException (_objectName);
+
+      if (!_listening) {
+        var msg = "The listener has not been started.";
+
+        throw new InvalidOperationException (msg);
+      }
 
       if (asyncResult == null)
         throw new ArgumentNullException ("asyncResult");
@@ -848,21 +872,21 @@ namespace WebSocketSharp.Net
     /// Gets an incoming request.
     /// </summary>
     /// <remarks>
-    /// This method waits for an incoming request and returns when a request is
-    /// received.
+    /// This method waits for an incoming request and returns when
+    /// a request is received.
     /// </remarks>
     /// <returns>
     /// A <see cref="HttpListenerContext"/> that represents a request.
     /// </returns>
     /// <exception cref="InvalidOperationException">
     ///   <para>
-    ///   This listener has no URI prefix on which listens.
+    ///   This listener has not been started or is currently stopped.
     ///   </para>
     ///   <para>
     ///   -or-
     ///   </para>
     ///   <para>
-    ///   This listener has not been started or is currently stopped.
+    ///   This listener has no URI prefix on which listens.
     ///   </para>
     /// </exception>
     /// <exception cref="HttpListenerException">
@@ -876,14 +900,14 @@ namespace WebSocketSharp.Net
       if (_disposed)
         throw new ObjectDisposedException (_objectName);
 
-      if (_prefixes.Count == 0) {
-        var msg = "The listener has no URI prefix on which listens.";
+      if (!_listening) {
+        var msg = "The listener has not been started.";
 
         throw new InvalidOperationException (msg);
       }
 
-      if (!_listening) {
-        var msg = "The listener has not been started.";
+      if (_prefixes.Count == 0) {
+        var msg = "The listener has no URI prefix on which listens.";
 
         throw new InvalidOperationException (msg);
       }
@@ -908,16 +932,18 @@ namespace WebSocketSharp.Net
       if (_disposed)
         throw new ObjectDisposedException (_objectName);
 
-      lock (_contextRegistrySync) {
+      lock (_sync) {
         if (_disposed)
           throw new ObjectDisposedException (_objectName);
 
-        if (_listening)
-          return;
+        lock (_contextRegistrySync) {
+          if (_listening)
+            return;
 
-        EndPointManager.AddListener (this);
+          EndPointManager.AddListener (this);
 
-        _listening = true;
+          _listening = true;
+        }
       }
     }
 
@@ -932,11 +958,16 @@ namespace WebSocketSharp.Net
       if (_disposed)
         throw new ObjectDisposedException (_objectName);
 
-      lock (_contextRegistrySync) {
-        if (!_listening)
-          return;
+      lock (_sync) {
+        if (_disposed)
+          throw new ObjectDisposedException (_objectName);
 
-        _listening = false;
+        lock (_contextRegistrySync) {
+          if (!_listening)
+            return;
+
+          _listening = false;
+        }
 
         cleanupContextQueue (false);
         cleanupContextRegistry ();
@@ -960,12 +991,7 @@ namespace WebSocketSharp.Net
       if (_disposed)
         return;
 
-      lock (_contextRegistrySync) {
-        if (_disposed)
-          return;
-
-        close (true);
-      }
+      close (true);
     }
 
     #endregion
